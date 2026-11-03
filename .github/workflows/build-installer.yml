@@ -1,0 +1,415 @@
+name: Build Special K installer
+
+# Builds SpecialK, SKIF, SKIFsvc, SKIV (Release, 32-bit + 64-bit) and XInput_HID
+# (Release, 64-bit) as one parallel job per project and architecture, assembles
+# the installer's Source folder, compiles SpecialK.iss with Inno Setup, and
+# publishes the resulting installer to this repository's Releases.
+#
+#   resolve ──► build (9 parallel jobs) ──► package
+#
+# "resolve" pins every repo to one exact commit up front, so both architectures
+# of a project are always built from the same commit even if a push lands
+# while the run is in progress.
+
+on:
+  workflow_dispatch:
+    inputs:
+      specialk_ref:
+        description: 'SpecialKO/SpecialK branch, tag or full SHA (blank = default branch)'
+        required: false
+        default: ''
+      skif_ref:
+        description: 'SpecialKO/SKIF branch, tag or full SHA (blank = default branch)'
+        required: false
+        default: ''
+      skifsvc_ref:
+        description: 'SpecialKO/SKIFsvc branch, tag or full SHA (blank = default branch)'
+        required: false
+        default: ''
+      skiv_ref:
+        description: 'SpecialKO/SKIV branch, tag or full SHA (blank = default branch)'
+        required: false
+        default: ''
+      xinput_hid_ref:
+        description: 'SpecialKO/XInput_HID branch, tag or full SHA (blank = default branch)'
+        required: false
+        default: ''
+      installer_ref:
+        description: 'SpecialKO/Installer branch, tag or full SHA (blank = default branch)'
+        required: false
+        default: ''
+      prerelease:
+        description: 'Mark the GitHub release as a pre-release'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write   # needed to create releases / upload release assets
+
+concurrency:
+  group: build-installer
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) Resolve every repo's ref to an exact commit SHA
+  # ---------------------------------------------------------------------------
+  resolve:
+    name: Resolve commits
+    runs-on: ubuntu-latest
+    outputs:
+      shas: ${{ steps.resolve.outputs.shas }}
+    steps:
+      - name: Resolve refs
+        id: resolve
+        shell: bash
+        env:
+          SPECIALK_REF:   ${{ inputs.specialk_ref }}
+          SKIF_REF:       ${{ inputs.skif_ref }}
+          SKIFSVC_REF:    ${{ inputs.skifsvc_ref }}
+          SKIV_REF:       ${{ inputs.skiv_ref }}
+          XINPUT_HID_REF: ${{ inputs.xinput_hid_ref }}
+          INSTALLER_REF:  ${{ inputs.installer_ref }}
+        run: |
+          set -euo pipefail
+
+          # Resolve a branch, tag or full SHA (blank = default branch) to a commit SHA
+          resolve() {
+            local repo="$1" ref="$2" url="https://github.com/$1.git" out sha
+            if [[ "$ref" =~ ^[0-9a-fA-F]{40}$ ]]; then echo "$ref"; return 0; fi
+            if [[ -z "$ref" ]]; then
+              sha=$(git ls-remote "$url" HEAD | awk '$2=="HEAD"{print $1}')
+            else
+              out=$(git ls-remote "$url" "refs/heads/$ref" "refs/tags/$ref" "refs/tags/$ref^{}")
+              sha=$(awk -v r="refs/heads/$ref"    '$2==r{print $1}' <<<"$out")
+              [[ -n "$sha" ]] || sha=$(awk -v r="refs/tags/$ref^{}" '$2==r{print $1}' <<<"$out")  # annotated tag -> commit
+              [[ -n "$sha" ]] || sha=$(awk -v r="refs/tags/$ref"    '$2==r{print $1}' <<<"$out")  # lightweight tag
+            fi
+            if [[ -z "$sha" ]]; then
+              echo "::error::Could not resolve '$ref' in $repo. Use a branch, a tag, or a full 40-character commit SHA." >&2
+              return 1
+            fi
+            echo "$sha"
+          }
+
+          specialk=$(resolve SpecialKO/SpecialK    "$SPECIALK_REF")
+          skif=$(resolve     SpecialKO/SKIF        "$SKIF_REF")
+          skifsvc=$(resolve  SpecialKO/SKIFsvc     "$SKIFSVC_REF")
+          skiv=$(resolve     SpecialKO/SKIV        "$SKIV_REF")
+          xinput=$(resolve   SpecialKO/XInput_HID  "$XINPUT_HID_REF")
+          installer=$(resolve SpecialKO/Installer  "$INSTALLER_REF")
+
+          shas=$(jq -cn \
+            --arg SpecialK "$specialk" --arg SKIF "$skif" --arg SKIFsvc "$skifsvc" \
+            --arg SKIV "$skiv" --arg XInput_HID "$xinput" --arg Installer "$installer" \
+            '{SpecialK:$SpecialK, SKIF:$SKIF, SKIFsvc:$SKIFsvc, SKIV:$SKIV, XInput_HID:$XInput_HID, Installer:$Installer}')
+          echo "shas=$shas" >> "$GITHUB_OUTPUT"
+          jq . <<<"$shas"
+
+  # ---------------------------------------------------------------------------
+  # 2) Build every project/architecture combination in parallel
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.name }} (${{ matrix.platform }})
+    needs: resolve
+    runs-on: windows-2022
+    strategy:
+      # Let every job finish so one failure doesn't cancel (and mask) the others
+      fail-fast: false
+      matrix:
+        include:
+          # SpecialK writes its output to %USERPROFILE%\Documents\My Mods\SpecialK
+          - { name: SpecialK,   repo: SpecialKO/SpecialK,   sln: SpecialK.sln,   platform: x64,   nuget: false, out_in_mymods: true,  output: SpecialK64.dll, symbols: SpecialK64.pdb }
+          - { name: SpecialK,   repo: SpecialKO/SpecialK,   sln: SpecialK.sln,   platform: Win32, nuget: false, out_in_mymods: true,  output: SpecialK32.dll, symbols: SpecialK32.pdb }
+          - { name: SKIF,       repo: SpecialKO/SKIF,       sln: SKIF.sln,       platform: x64,   nuget: true,  out_in_mymods: false, output: SKIF.exe,       symbols: SKIF.pdb }
+          - { name: SKIF,       repo: SpecialKO/SKIF,       sln: SKIF.sln,       platform: Win32, nuget: true,  out_in_mymods: false, output: SKIF32.exe,     symbols: SKIF32.pdb }
+          # SKIFsvc.sln names its 32-bit platform "x86"
+          - { name: SKIFsvc,    repo: SpecialKO/SKIFsvc,    sln: SKIFsvc.sln,    platform: x64,   nuget: true,  out_in_mymods: false, output: SKIFsvc64.exe,  symbols: SKIFsvc64.pdb }
+          - { name: SKIFsvc,    repo: SpecialKO/SKIFsvc,    sln: SKIFsvc.sln,    platform: x86,   nuget: true,  out_in_mymods: false, output: SKIFsvc32.exe,  symbols: SKIFsvc32.pdb }
+          - { name: SKIV,       repo: SpecialKO/SKIV,       sln: SKIV.sln,       platform: x64,   nuget: true,  out_in_mymods: false, output: SKIV.exe,       symbols: SKIV.pdb }
+          - { name: SKIV,       repo: SpecialKO/SKIV,       sln: SKIV.sln,       platform: Win32, nuget: true,  out_in_mymods: false, output: SKIV32.exe,     symbols: SKIV32.pdb }
+          # SpecialK.iss only installs XInput1_4.dll on 64-bit Windows. The project
+          # hardcodes OutDir to a developer's local path (redirected to .\Builds\),
+          # and its Release|x64 config doesn't generate debug symbols.
+          - { name: XInput_HID, repo: SpecialKO/XInput_HID, sln: XInput_HID.sln, platform: x64,   nuget: false, out_in_mymods: false, override_outdir: true, output: XInput1_4.dll, symbols: '' }
+
+    steps:
+      - name: Check out ${{ matrix.repo }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo }}
+          ref: ${{ fromJSON(needs.resolve.outputs.shas)[matrix.name] }}
+          submodules: recursive
+
+      - uses: SpecialKO/GA-setup-cpp-n20@master
+
+      - uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[17.0,18.0)'
+
+      - name: Restore NuGet packages
+        if: matrix.nuget
+        run: nuget restore ${{ matrix.sln }}
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $extra = @()
+          if ('${{ matrix.override_outdir }}' -eq 'true') { $extra += "-p:OutDir=$PWD\Builds\" }
+          msbuild ${{ matrix.sln }} -p:Configuration="Release" -p:Platform="${{ matrix.platform }}" -m @extra
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Collect build output
+        shell: pwsh
+        run: |
+          $outDir = if ('${{ matrix.out_in_mymods }}' -eq 'true') {
+            Join-Path $env:USERPROFILE 'Documents\My Mods\SpecialK'
+          } else {
+            Join-Path $PWD 'Builds'
+          }
+          $stage = Join-Path $env:RUNNER_TEMP 'stage'
+          New-Item -ItemType Directory -Force -Path "$stage\bin", "$stage\symbols" | Out-Null
+
+          $src = Join-Path $outDir '${{ matrix.output }}'
+          if (-not (Test-Path $src)) { throw "Expected build output not found: $src" }
+          Copy-Item $src "$stage\bin\"
+          Write-Host ("{0,-16} {1}" -f '${{ matrix.output }}', (Get-Item $src).VersionInfo.ProductVersion)
+
+          if ('${{ matrix.symbols }}') {
+            $pdb = Join-Path $outDir '${{ matrix.symbols }}'
+            if (Test-Path $pdb) { Copy-Item $pdb "$stage\symbols\" }
+            else { Write-Warning "Debug symbols not found: $pdb" }
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.name }}-${{ matrix.platform }}
+          path: ${{ runner.temp }}/stage/bin/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.symbols != ''
+        with:
+          name: symbols-${{ matrix.name }}-${{ matrix.platform }}
+          path: ${{ runner.temp }}/stage/symbols/*
+          if-no-files-found: warn
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 3) Assemble Source\, compile SpecialK.iss, publish the release
+  # ---------------------------------------------------------------------------
+  package:
+    name: Package installer & publish release
+    needs: [resolve, build]
+    runs-on: windows-2022
+    env:
+      # SpecialK.iss uses WizardStyle "hidebevels", which needs Inno Setup 6.7.0+
+      INNO_MIN_VERSION: '6.7.0'
+      SHAS: ${{ needs.resolve.outputs.shas }}
+
+    steps:
+      - name: Check out SpecialKO/Installer
+        uses: actions/checkout@v4
+        with:
+          repository: SpecialKO/Installer
+          ref: ${{ fromJSON(needs.resolve.outputs.shas).Installer }}
+          path: Installer
+
+      - name: Download build outputs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: artifacts/bin
+          merge-multiple: true
+
+      - name: Download debug symbols
+        uses: actions/download-artifact@v4
+        with:
+          pattern: symbols-*
+          path: artifacts/symbols
+          merge-multiple: true
+
+      - name: Assemble Source folder
+        shell: pwsh
+        run: |
+          # Installer\Source already contains Assets, Global, ReadMe and Version
+          # from the SpecialKO/Installer repo; add the binaries and empty dirs.
+          $src = Resolve-Path 'Installer\Source'
+          $bin = Resolve-Path 'artifacts\bin'
+
+          New-Item -ItemType Directory -Force -Path "$src\Servlet" | Out-Null
+          foreach ($f in 'SKIF.exe','SKIF32.exe','SKIV.exe','SKIV32.exe','SpecialK32.dll','SpecialK64.dll','XInput1_4.dll') {
+            Copy-Item "$bin\$f" "$src\$f" -Force
+          }
+          foreach ($f in 'SKIFsvc32.exe','SKIFsvc64.exe') {
+            Copy-Item "$bin\$f" "$src\Servlet\$f" -Force
+          }
+
+          # Empty folders (git does not track these). The .iss copies Source\*
+          # with "createallsubdirs", so empty folders are carried into the installer.
+          foreach ($d in 'Profiles',
+                         'PlugIns\ThirdParty\Image Codecs',
+                         'PlugIns\ThirdParty\NVIDIA',
+                         'PlugIns\ThirdParty\ReShade',
+                         'PlugIns\ThirdParty\Steamworks') {
+            New-Item -ItemType Directory -Force -Path (Join-Path $src $d) | Out-Null
+          }
+
+          # Verify the expected layout
+          $expectedFiles = @(
+            'SKIF.exe','SKIF32.exe','SKIV.exe','SKIV32.exe','SpecialK32.dll','SpecialK64.dll','XInput1_4.dll',
+            'Assets\lc_user.json',
+            'Global\blacklist.ini','Global\default_SpecialK.ini','Global\whitelist.ini',
+            'ReadMe\cvars.txt','ReadMe\setup.txt',
+            'Servlet\SKIFsvc32.exe','Servlet\SKIFsvc64.exe',
+            'Version\installed.ini','Version\repository.ini'
+          )
+          $missing = $expectedFiles | Where-Object { -not (Test-Path (Join-Path $src $_) -PathType Leaf) }
+          if ($missing) { throw "Source folder is missing: $($missing -join ', ')" }
+
+          $actual = Get-ChildItem $src -Recurse -File | ForEach-Object { $_.FullName.Substring($src.Path.Length + 1) }
+          $extra  = $actual | Where-Object { $_ -notin $expectedFiles }
+          if ($extra) { Write-Warning "Source folder contains unexpected extra files: $($extra -join ', ')" }
+
+          Write-Host "Source folder layout:"
+          cmd /c tree /F "$src"
+
+      - name: Install Inno Setup
+        id: inno
+        shell: pwsh
+        run: |
+          # Inno Setup records its version and install folder in its uninstall
+          # registry key; ISCC.exe's own version resource doesn't report it reliably.
+          function Find-InnoSetup {
+            $keys = @(
+              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup *_is1'
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup *_is1'
+              'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup *_is1'
+            )
+            $keys | ForEach-Object { Get-ItemProperty -Path $_ -ErrorAction SilentlyContinue } | ForEach-Object {
+              if (-not $_.InstallLocation -or -not $_.DisplayVersion) { return }
+              $iscc = Join-Path $_.InstallLocation 'ISCC.exe'
+              $ver  = [version]'0.0'
+              if ((Test-Path $iscc) -and [version]::TryParse(($_.DisplayVersion -replace '[^\d\.].*$', ''), [ref]$ver)) {
+                [pscustomobject]@{ Version = $ver; Iscc = $iscc }
+              }
+            } | Sort-Object Version -Descending | Select-Object -First 1
+          }
+
+          $min  = [version]$env:INNO_MIN_VERSION
+          $inno = Find-InnoSetup
+          if ($inno) { Write-Host "Found Inno Setup $($inno.Version) at $($inno.Iscc)" }
+          else       { Write-Host 'Inno Setup is not installed.' }
+
+          if (-not $inno -or $inno.Version -lt $min) {
+            Write-Host "Installing/upgrading Inno Setup (need $min or newer) via Chocolatey..."
+            choco upgrade innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco upgrade innosetup failed with exit code $LASTEXITCODE" }
+            $inno = Find-InnoSetup
+            if (-not $inno) { throw 'Inno Setup could not be found after installing it.' }
+            Write-Host "Now using Inno Setup $($inno.Version) at $($inno.Iscc)"
+          }
+
+          if ($inno.Version -lt $min) {
+            throw "Inno Setup $($inno.Version) is older than the required $min"
+          }
+          "iscc=$($inno.Iscc)" >> $env:GITHUB_OUTPUT
+
+      - name: Compile installer
+        shell: pwsh
+        working-directory: Installer
+        run: |
+          New-Item -ItemType Directory -Force -Path Builds | Out-Null
+          & '${{ steps.inno.outputs.iscc }}' /Q SpecialK.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          Get-ChildItem Builds
+
+      - name: Gather release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $src = 'Installer\Source'
+          function Get-Ver($path) {
+            $v = (Get-Item $path).VersionInfo.ProductVersion
+            if ([string]::IsNullOrWhiteSpace($v)) { 'unknown' } else { $v.Trim() }
+          }
+          $sk     = Get-Ver "$src\SpecialK64.dll"
+          $skif   = Get-Ver "$src\SKIF.exe"
+          $svc    = Get-Ver "$src\Servlet\SKIFsvc64.exe"
+          $skiv   = Get-Ver "$src\SKIV.exe"
+          $xinput = Get-Ver "$src\XInput1_4.dll"
+
+          $installer = Get-ChildItem 'Installer\Builds\*.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'No installer was produced in Installer\Builds' }
+
+          # Bundle debug symbols as a separate release asset
+          $symZip = Join-Path $env:RUNNER_TEMP "SpecialK_${sk}_debug_symbols.zip"
+          if (Get-ChildItem 'artifacts\symbols' -File -ErrorAction SilentlyContinue) {
+            Compress-Archive -Path 'artifacts\symbols\*' -DestinationPath $symZip -Force
+          } else { $symZip = '' }
+
+          $shas = $env:SHAS | ConvertFrom-Json
+          $commits = foreach ($p in 'SpecialK','SKIF','SKIFsvc','SKIV','XInput_HID','Installer') {
+            '- `SpecialKO/' + $p + '@' + $shas.$p + '`'
+          }
+
+          $notes = @"
+          Automated build of the combined Special K installer.
+
+          | Component  | Version |
+          |------------|---------|
+          | Special K  | $sk |
+          | SKIF       | $skif |
+          | SKIFsvc    | $svc |
+          | SKIV       | $skiv |
+          | XInput_HID | $xinput |
+
+          **Built from:**
+          $($commits -join "`n")
+
+          Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          "@
+          $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          $notes | Out-File $notesFile -Encoding utf8
+
+          "version=$sk"                      >> $env:GITHUB_OUTPUT
+          "tag=v$sk"                         >> $env:GITHUB_OUTPUT
+          "installer=$($installer.FullName)" >> $env:GITHUB_OUTPUT
+          "symbols=$symZip"                  >> $env:GITHUB_OUTPUT
+          "notes=$notesFile"                 >> $env:GITHUB_OUTPUT
+
+      - name: Upload installer as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpecialK_${{ steps.meta.outputs.version }}_installer
+          path: ${{ steps.meta.outputs.installer }}
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag   = '${{ steps.meta.outputs.tag }}'
+          $title = 'Special K ${{ steps.meta.outputs.version }}'
+          $assets = @('${{ steps.meta.outputs.installer }}')
+          if ('${{ steps.meta.outputs.symbols }}') { $assets += '${{ steps.meta.outputs.symbols }}' }
+          $pre = if ('${{ inputs.prerelease }}' -eq 'true') { '--prerelease' } else { '--latest' }
+
+          gh release view $tag --repo '${{ github.repository }}' *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag already exists; replacing its assets and notes."
+            gh release upload $tag @assets --clobber --repo '${{ github.repository }}'
+            if ($LASTEXITCODE -ne 0) { throw 'gh release upload failed' }
+            gh release edit $tag --notes-file '${{ steps.meta.outputs.notes }}' --repo '${{ github.repository }}'
+          } else {
+            gh release create $tag @assets `
+              --repo '${{ github.repository }}' `
+              --target '${{ github.sha }}' `
+              --title $title `
+              --notes-file '${{ steps.meta.outputs.notes }}' `
+              $pre
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Publishing the release failed' }
