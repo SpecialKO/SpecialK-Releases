@@ -15,27 +15,27 @@ on:
   workflow_dispatch:
     inputs:
       specialk_ref:
-        description: 'SpecialKO/SpecialK branch, tag or full SHA (blank = default branch)'
+        description: 'SpecialKO/SpecialK branch, tag or full SHA (blank = release branch)'
         required: false
         default: ''
       skif_ref:
-        description: 'SpecialKO/SKIF branch, tag or full SHA (blank = default branch)'
+        description: 'SpecialKO/SKIF branch, tag or full SHA (blank = release branch)'
         required: false
         default: ''
       skifsvc_ref:
-        description: 'SpecialKO/SKIFsvc branch, tag or full SHA (blank = default branch)'
+        description: 'SpecialKO/SKIFsvc branch, tag or full SHA (blank = release branch)'
         required: false
         default: ''
       skiv_ref:
-        description: 'SpecialKO/SKIV branch, tag or full SHA (blank = default branch)'
+        description: 'SpecialKO/SKIV branch, tag or full SHA (blank = release branch)'
         required: false
         default: ''
       xinput_hid_ref:
-        description: 'SpecialKO/XInput_HID branch, tag or full SHA (blank = default branch)'
+        description: 'SpecialKO/XInput_HID branch, tag or full SHA (blank = release branch)'
         required: false
         default: ''
       installer_ref:
-        description: 'SpecialKO/Installer branch, tag or full SHA (blank = default branch)'
+        description: 'SpecialKO/Installer branch, tag or full SHA (blank = release branch)'
         required: false
         default: ''
       prerelease:
@@ -43,6 +43,12 @@ on:
         type: boolean
         required: false
         default: true
+
+env:
+  # Branch built when a ref input is left blank. Every repo needs this branch;
+  # to build a repo's development branch instead, type its name (e.g. main) in
+  # that repo's input.
+  DEFAULT_BRANCH: release
 
 permissions:
   contents: write   # needed to create releases / upload release assets
@@ -74,12 +80,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Resolve a branch, tag or full SHA (blank = default branch) to a commit SHA
+          # Resolve a branch, tag or full SHA (blank = $DEFAULT_BRANCH) to a commit SHA
           resolve() {
             local repo="$1" ref="$2" url="https://github.com/$1.git" out sha
             if [[ "$ref" =~ ^[0-9a-fA-F]{40}$ ]]; then echo "$ref"; return 0; fi
             if [[ -z "$ref" ]]; then
-              sha=$(git ls-remote "$url" HEAD | awk '$2=="HEAD"{print $1}')
+              sha=$(git ls-remote "$url" "refs/heads/$DEFAULT_BRANCH" | awk '{print $1}')
+              if [[ -z "$sha" ]]; then
+                echo "::error::$repo has no '$DEFAULT_BRANCH' branch. Create it, or enter a branch, tag or commit for $repo when starting the run." >&2
+                return 1
+              fi
             else
               out=$(git ls-remote "$url" "refs/heads/$ref" "refs/tags/$ref" "refs/tags/$ref^{}")
               sha=$(awk -v r="refs/heads/$ref"    '$2==r{print $1}' <<<"$out")
@@ -93,12 +103,15 @@ jobs:
             echo "$sha"
           }
 
-          specialk=$(resolve SpecialKO/SpecialK    "$SPECIALK_REF")
-          skif=$(resolve     SpecialKO/SKIF        "$SKIF_REF")
-          skifsvc=$(resolve  SpecialKO/SKIFsvc     "$SKIFSVC_REF")
-          skiv=$(resolve     SpecialKO/SKIV        "$SKIV_REF")
-          xinput=$(resolve   SpecialKO/XInput_HID  "$XINPUT_HID_REF")
-          installer=$(resolve SpecialKO/Installer  "$INSTALLER_REF")
+          # Resolve all repos before failing, so every problem is reported in one run
+          failed=0
+          specialk=$(resolve SpecialKO/SpecialK    "$SPECIALK_REF")   || failed=1
+          skif=$(resolve     SpecialKO/SKIF        "$SKIF_REF")       || failed=1
+          skifsvc=$(resolve  SpecialKO/SKIFsvc     "$SKIFSVC_REF")    || failed=1
+          skiv=$(resolve     SpecialKO/SKIV        "$SKIV_REF")       || failed=1
+          xinput=$(resolve   SpecialKO/XInput_HID  "$XINPUT_HID_REF") || failed=1
+          installer=$(resolve SpecialKO/Installer  "$INSTALLER_REF")  || failed=1
+          (( failed == 0 )) || exit 1
 
           shas=$(jq -cn \
             --arg SpecialK "$specialk" --arg SKIF "$skif" --arg SKIFsvc "$skifsvc" \
