@@ -21,6 +21,14 @@ on:
           - release
           - pre-release
         default: release
+      prerelease:
+        description: 'Mark the GitHub release as a pre-release ("match branch" = only when building pre-release)'
+        type: choice
+        options:
+          - match branch
+          - 'yes'
+          - 'no'
+        default: match branch
       specialk_ref:
         description: 'SpecialKO/SpecialK branch, tag or full SHA (blank = the branch picked above)'
         required: false
@@ -45,11 +53,6 @@ on:
         description: 'SpecialKO/Installer branch, tag or full SHA (blank = the branch picked above)'
         required: false
         default: ''
-      prerelease:
-        description: 'Mark the GitHub release as a pre-release'
-        type: boolean
-        required: false
-        default: true
 
 permissions:
   contents: write   # needed to create releases / upload release assets
@@ -447,14 +450,21 @@ jobs:
           $assets = @('${{ steps.meta.outputs.installer }}')
           if ('${{ steps.meta.outputs.symbols }}') { $assets += '${{ steps.meta.outputs.symbols }}' }
           if ('${{ steps.meta.outputs.release_notes }}') { $assets += '${{ steps.meta.outputs.release_notes }}' }
-          $pre = if ('${{ inputs.prerelease }}' -eq 'true') { '--prerelease' } else { '--latest' }
+          $isPre = switch ('${{ inputs.prerelease }}') {
+            'yes'   { $true }
+            'no'    { $false }
+            default { '${{ inputs.branch }}' -eq 'pre-release' }   # "match branch"
+          }
+          $pre = if ($isPre) { '--prerelease' } else { '--latest' }
+          Write-Host "Pre-release: $isPre"
 
           gh release view $tag --repo '${{ github.repository }}' *> $null
           if ($LASTEXITCODE -eq 0) {
             Write-Host "Release $tag already exists; replacing its assets and notes."
             gh release upload $tag @assets --clobber --repo '${{ github.repository }}'
             if ($LASTEXITCODE -ne 0) { throw 'gh release upload failed' }
-            gh release edit $tag --notes-file '${{ steps.meta.outputs.notes }}' --repo '${{ github.repository }}'
+            gh release edit $tag --notes-file '${{ steps.meta.outputs.notes }}' --repo '${{ github.repository }}' `
+              "--prerelease=$($isPre.ToString().ToLower())" $(if (-not $isPre) { '--latest' })
           } else {
             gh release create $tag @assets `
               --repo '${{ github.repository }}' `
