@@ -14,28 +14,35 @@ name: Build Special K installer
 on:
   workflow_dispatch:
     inputs:
+      branch:
+        description: 'Branch to build in every repo (a repo field below overrides it)'
+        type: choice
+        options:
+          - release
+          - pre-release
+        default: release
       specialk_ref:
-        description: 'SpecialKO/SpecialK branch, tag or full SHA (blank = release branch)'
+        description: 'SpecialKO/SpecialK branch, tag or full SHA (blank = the branch picked above)'
         required: false
         default: ''
       skif_ref:
-        description: 'SpecialKO/SKIF branch, tag or full SHA (blank = release branch)'
+        description: 'SpecialKO/SKIF branch, tag or full SHA (blank = the branch picked above)'
         required: false
         default: ''
       skifsvc_ref:
-        description: 'SpecialKO/SKIFsvc branch, tag or full SHA (blank = release branch)'
+        description: 'SpecialKO/SKIFsvc branch, tag or full SHA (blank = the branch picked above)'
         required: false
         default: ''
       skiv_ref:
-        description: 'SpecialKO/SKIV branch, tag or full SHA (blank = release branch)'
+        description: 'SpecialKO/SKIV branch, tag or full SHA (blank = the branch picked above)'
         required: false
         default: ''
       xinput_hid_ref:
-        description: 'SpecialKO/XInput_HID branch, tag or full SHA (blank = release branch)'
+        description: 'SpecialKO/XInput_HID branch, tag or full SHA (blank = the branch picked above)'
         required: false
         default: ''
       installer_ref:
-        description: 'SpecialKO/Installer branch, tag or full SHA (blank = release branch)'
+        description: 'SpecialKO/Installer branch, tag or full SHA (blank = the branch picked above)'
         required: false
         default: ''
       prerelease:
@@ -43,12 +50,6 @@ on:
         type: boolean
         required: false
         default: true
-
-env:
-  # Branch built when a ref input is left blank. Every repo needs this branch;
-  # to build a repo's development branch instead, type its name (e.g. main) in
-  # that repo's input.
-  DEFAULT_BRANCH: release
 
 permissions:
   contents: write   # needed to create releases / upload release assets
@@ -71,6 +72,10 @@ jobs:
         id: resolve
         shell: bash
         env:
+          # Branch used for every repo whose field is left blank; each repo
+          # needs this branch. Typing a branch, tag or commit in a repo's field
+          # (e.g. main) builds that instead, for that repo only.
+          DEFAULT_BRANCH: ${{ inputs.branch }}
           SPECIALK_REF:   ${{ inputs.specialk_ref }}
           SKIF_REF:       ${{ inputs.skif_ref }}
           SKIFSVC_REF:    ${{ inputs.skifsvc_ref }}
