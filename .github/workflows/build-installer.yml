@@ -230,6 +230,22 @@ jobs:
           ref: ${{ fromJSON(needs.resolve.outputs.shas).Installer }}
           path: Installer
 
+      # Release notes come from CHANGELOG.txt at the SpecialK commit that was built
+      - name: Check out SpecialK's CHANGELOG.txt
+        uses: actions/checkout@v4
+        with:
+          repository: SpecialKO/SpecialK
+          ref: ${{ fromJSON(needs.resolve.outputs.shas).SpecialK }}
+          path: SpecialK
+          sparse-checkout: CHANGELOG.txt
+          sparse-checkout-cone-mode: false
+
+      # This repo, for .github/scripts
+      - name: Check out workflow scripts
+        uses: actions/checkout@v4
+        with:
+          path: releases
+
       - name: Download build outputs
         uses: actions/download-artifact@v4
         with:
@@ -363,6 +379,20 @@ jobs:
             Compress-Archive -Path 'artifacts\symbols\*' -DestinationPath $symZip -Force
           } else { $symZip = '' }
 
+          # Release notes for SKIF's updater: this version's section of
+          # SpecialK's CHANGELOG.txt, attached to the release as ReleaseNotes.txt
+          # so "Publish installer to CDN" uses exactly these notes.
+          $notesAsset = Join-Path $env:RUNNER_TEMP 'ReleaseNotes.txt'
+          python releases\.github\scripts\changelog_section.py SpecialK\CHANGELOG.txt $sk --output $notesAsset
+          if ($LASTEXITCODE -eq 0) {
+            $changes = "**Changes:**`n`n``````text`n" + (Get-Content $notesAsset -Raw -Encoding utf8).TrimEnd() + "`n```````n"
+          } else {
+            Write-Warning "No CHANGELOG.txt section for $sk in SpecialK; publishing this release to the CDN as a new version will be refused until it has one."
+            $notesAsset = ''
+            $changes = "_CHANGELOG.txt has no section for $sk._`n"
+          }
+          $global:LASTEXITCODE = 0
+
           $shas = $env:SHAS | ConvertFrom-Json
           $commits = foreach ($p in 'SpecialK','SKIF','SKIFsvc','SKIV','XInput_HID','Installer') {
             '- `SpecialKO/' + $p + '@' + $shas.$p + '`'
@@ -379,6 +409,7 @@ jobs:
           | SKIV       | $skiv |
           | XInput_HID | $xinput |
 
+          $changes
           **Built from:**
           $($commits -join "`n")
 
@@ -392,6 +423,7 @@ jobs:
           "installer=$($installer.FullName)" >> $env:GITHUB_OUTPUT
           "symbols=$symZip"                  >> $env:GITHUB_OUTPUT
           "notes=$notesFile"                 >> $env:GITHUB_OUTPUT
+          "release_notes=$notesAsset"        >> $env:GITHUB_OUTPUT
 
       - name: Upload installer as workflow artifact
         uses: actions/upload-artifact@v4
@@ -409,6 +441,7 @@ jobs:
           $title = 'Special K ${{ steps.meta.outputs.version }}'
           $assets = @('${{ steps.meta.outputs.installer }}')
           if ('${{ steps.meta.outputs.symbols }}') { $assets += '${{ steps.meta.outputs.symbols }}' }
+          if ('${{ steps.meta.outputs.release_notes }}') { $assets += '${{ steps.meta.outputs.release_notes }}' }
           $pre = if ('${{ inputs.prerelease }}' -eq 'true') { '--prerelease' } else { '--latest' }
 
           gh release view $tag --repo '${{ github.repository }}' *> $null

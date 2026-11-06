@@ -1,0 +1,275 @@
+name: Publish installer to CDN
+
+# Publishes an installer from this repository's GitHub Releases to the CDN, and
+# lists it in repository.json so SKIF's auto-updater offers it on the chosen
+# update channels.
+#
+#   1. Run "Build Special K installer" and test the installer it releases.
+#   2. Run this workflow with that release's tag and pick the channels.
+#
+# Running it again for an already-published version only adds the newly
+# picked channels to it (e.g. promote a Discord build to Website).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'GitHub release to publish (e.g. v26.11.5)'
+        required: true
+      discord:
+        description: 'Discord channel (updates regularly)'
+        type: boolean
+        default: true
+      website:
+        description: 'Website channel (stable releases)'
+        type: boolean
+        default: false
+      ancient:
+        description: 'Ancient channel (older stable release)'
+        type: boolean
+        default: false
+      label:
+        description: 'Optional label after the version, e.g. HOTFIX or Release Candidate (new versions only)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Dry run: show the change to repository.json, upload nothing'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-cdn
+  cancel-in-progress: false
+
+env:
+  CDN_URL: https://sk-data.special-k.info   # public URL of the Space
+  INSTALLER_DIR: repository                 # installers live in <Space>/repository/
+  REPOSITORY_KEY: repository.json           # SKIF's update manifest, at the Space root
+  # Newer AWS CLI releases send checksum headers that S3-compatible services
+  # don't all accept; only send them when the API requires it.
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+
+jobs:
+  publish:
+    name: Publish ${{ inputs.tag }}${{ inputs.dry_run && ' (dry run)' || '' }}
+    runs-on: ubuntu-latest
+    # Created automatically on first use. Add required reviewers to it under
+    # Settings > Environments to require an approval before every publish.
+    environment: cdn
+    env:
+      AWS_ACCESS_KEY_ID:     ${{ secrets.DO_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.DO_SECRET_KEY }}
+      SPACE_NAME:            ${{ secrets.DO_SPACE_NAME }}
+      SPACE_REGION:          ${{ secrets.DO_SPACE_REGION }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check inputs and secrets
+        id: inputs
+        shell: bash
+        env:
+          DISCORD: ${{ inputs.discord }}
+          WEBSITE: ${{ inputs.website }}
+          ANCIENT: ${{ inputs.ancient }}
+        run: |
+          set -euo pipefail
+          channels=()
+          [[ "$DISCORD" == true ]] && channels+=(Discord)
+          [[ "$WEBSITE" == true ]] && channels+=(Website)
+          [[ "$ANCIENT" == true ]] && channels+=(Ancient)
+          if (( ${#channels[@]} == 0 )); then
+            echo "::error::Pick at least one channel (Discord, Website or Ancient)."; exit 1
+          fi
+          missing=()
+          [[ -n "$AWS_ACCESS_KEY_ID"     ]] || missing+=(DO_ACCESS_KEY)
+          [[ -n "$AWS_SECRET_ACCESS_KEY" ]] || missing+=(DO_SECRET_KEY)
+          [[ -n "$SPACE_NAME"            ]] || missing+=(DO_SPACE_NAME)
+          [[ -n "$SPACE_REGION"          ]] || missing+=(DO_SPACE_REGION)
+          if (( ${#missing[@]} )); then
+            echo "::error::Missing secrets: ${missing[*]}. Add them to this repository (or the 'cdn' environment) under Settings > Secrets and variables > Actions."; exit 1
+          fi
+          echo "channels=$(IFS=,; echo "${channels[*]}")" >> "$GITHUB_OUTPUT"
+          echo "endpoint=https://${SPACE_REGION}.digitaloceanspaces.com" >> "$GITHUB_OUTPUT"
+
+      - name: Download release assets
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release \
+            --pattern 'SpecialK_*.exe' --pattern 'ReleaseNotes.txt'
+
+          mapfile -t exes < <(find release -maxdepth 1 -name 'SpecialK_*.exe' ! -name '*_Offline.exe' -printf '%f\n')
+          if (( ${#exes[@]} != 1 )); then
+            echo "::error::Expected exactly one SpecialK_<version>.exe in release $TAG, found: ${exes[*]:-none}"; exit 1
+          fi
+          file="${exes[0]}"
+          version="${file#SpecialK_}"; version="${version%.exe}"
+          if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+            echo "::error::Can't read a version number from '$file'"; exit 1
+          fi
+          [[ "$TAG" == "v$version" ]] || echo "::warning::Release tag '$TAG' doesn't match the installer version $version."
+
+          sha=$(sha256sum "release/$file" | cut -d' ' -f1)
+          notes=''; [[ -f release/ReleaseNotes.txt ]] && notes=release/ReleaseNotes.txt
+          {
+            echo "file=$file"
+            echo "path=release/$file"
+            echo "version=$version"
+            echo "sha256=$sha"
+            echo "notes=$notes"
+            echo "installer_key=$INSTALLER_DIR/$file"
+            echo "installer_url=$CDN_URL/$INSTALLER_DIR/$file"
+          } >> "$GITHUB_OUTPUT"
+          echo "$file  $version  sha256=$sha  notes=${notes:-(none)}"
+
+      - name: Download current repository.json
+        id: current
+        shell: bash
+        env:
+          ENDPOINT: ${{ steps.inputs.outputs.endpoint }}
+        run: |
+          set -euo pipefail
+          # Straight from the Space, not through the CDN, so it's never a stale copy
+          head=$(aws s3api head-object --endpoint-url "$ENDPOINT" --bucket "$SPACE_NAME" --key "$REPOSITORY_KEY")
+          aws s3api get-object --endpoint-url "$ENDPOINT" --bucket "$SPACE_NAME" --key "$REPOSITORY_KEY" repository.current.json > /dev/null
+          {
+            echo "etag=$(jq -r '.ETag' <<<"$head")"
+            echo "content_type=$(jq -r '.ContentType // "application/json"' <<<"$head")"
+            echo "cache_control=$(jq -r '.CacheControl // ""' <<<"$head")"
+          } >> "$GITHUB_OUTPUT"
+          echo "Downloaded $(stat -c %s repository.current.json) bytes (ETag $(jq -r '.ETag' <<<"$head"))"
+
+      - name: Keep a backup of the current repository.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: repository.json-before-${{ steps.release.outputs.version }}-run${{ github.run_number }}
+          path: repository.current.json
+          retention-days: 90
+
+      - name: Check the installer on the CDN
+        id: installer
+        shell: bash
+        env:
+          ENDPOINT: ${{ steps.inputs.outputs.endpoint }}
+          KEY: ${{ steps.release.outputs.installer_key }}
+          SHA: ${{ steps.release.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          if ! head=$(aws s3api head-object --endpoint-url "$ENDPOINT" --bucket "$SPACE_NAME" --key "$KEY" 2>/dev/null); then
+            echo "$KEY is not on the CDN yet; it will be uploaded."
+            echo "upload=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          remote=$(jq -r '.Metadata.sha256 // ""' <<<"$head")
+          if [[ -z "$remote" ]]; then
+            # Uploaded by hand (no checksum metadata): hash the file itself
+            aws s3api get-object --endpoint-url "$ENDPOINT" --bucket "$SPACE_NAME" --key "$KEY" remote.exe > /dev/null
+            remote=$(sha256sum remote.exe | cut -d' ' -f1); rm -f remote.exe
+          fi
+          if [[ "$remote" != "$SHA" ]]; then
+            echo "::error::A different $KEY is already on the CDN (sha256 $remote). Refusing to overwrite a published installer; SKIF may have cached the old one."; exit 1
+          fi
+          echo "$KEY is already on the CDN with the same checksum; it won't be uploaded again."
+          echo "upload=false" >> "$GITHUB_OUTPUT"
+
+      - name: Update repository.json
+        id: update
+        shell: bash
+        env:
+          VERSION:  ${{ steps.release.outputs.version }}
+          CHANNELS: ${{ steps.inputs.outputs.channels }}
+          URL:      ${{ steps.release.outputs.installer_url }}
+          SHA:      ${{ steps.release.outputs.sha256 }}
+          NOTES:    ${{ steps.release.outputs.notes }}
+          LABEL:    ${{ inputs.label }}
+          DRY_RUN:  ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          label="${LABEL#"${LABEL%%[![:space:]]*}"}"; label="${label%"${label##*[![:space:]]}"}"
+          if [[ -n "$label" && "$label" != \(*\) ]]; then label="($label)"; fi
+          description="Special K v $VERSION${label:+ $label}"
+
+          args=()
+          [[ -n "$NOTES" ]] && args+=(--notes-file "$NOTES")
+          python3 -I .github/scripts/update_repository.py \
+            --input repository.current.json --output repository.new.json \
+            --version "$VERSION" --channels "$CHANNELS" \
+            --installer-url "$URL" --sha256 "$SHA" --description "$description" \
+            --summary summary.md --github-output "$GITHUB_OUTPUT" "${args[@]}"
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$DRY_RUN" == true ]]; then
+            printf '\n**Dry run:** nothing was uploaded.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload installer
+        if: ${{ !inputs.dry_run && steps.update.outputs.changed == 'true' && steps.installer.outputs.upload == 'true' }}
+        shell: bash
+        env:
+          ENDPOINT: ${{ steps.inputs.outputs.endpoint }}
+          KEY:  ${{ steps.release.outputs.installer_key }}
+          FILE: ${{ steps.release.outputs.path }}
+          SHA:  ${{ steps.release.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          aws s3api put-object --endpoint-url "$ENDPOINT" --bucket "$SPACE_NAME" --key "$KEY" \
+            --body "$FILE" --acl public-read --content-type application/x-msdownload \
+            --metadata "sha256=$SHA" > /dev/null
+          echo "Uploaded $KEY"
+
+      - name: Upload repository.json
+        if: ${{ !inputs.dry_run && steps.update.outputs.changed == 'true' }}
+        shell: bash
+        env:
+          ENDPOINT:      ${{ steps.inputs.outputs.endpoint }}
+          ETAG:          ${{ steps.current.outputs.etag }}
+          CONTENT_TYPE:  ${{ steps.current.outputs.content_type }}
+          CACHE_CONTROL: ${{ steps.current.outputs.cache_control }}
+        run: |
+          set -euo pipefail
+          # Don't overwrite an edit someone made by hand while this run was going
+          now=$(aws s3api head-object --endpoint-url "$ENDPOINT" --bucket "$SPACE_NAME" --key "$REPOSITORY_KEY" | jq -r '.ETag')
+          if [[ "$now" != "$ETAG" ]]; then
+            echo "::error::repository.json changed on the CDN while this run was in progress. Nothing was overwritten; run the workflow again."; exit 1
+          fi
+          extra=()
+          [[ -n "$CACHE_CONTROL" ]] && extra+=(--cache-control "$CACHE_CONTROL")
+          aws s3api put-object --endpoint-url "$ENDPOINT" --bucket "$SPACE_NAME" --key "$REPOSITORY_KEY" \
+            --body repository.new.json --acl public-read --content-type "$CONTENT_TYPE" "${extra[@]}" > /dev/null
+          echo "Uploaded $REPOSITORY_KEY"
+
+      - name: Verify what SKIF will see
+        if: ${{ !inputs.dry_run && steps.update.outputs.changed == 'true' }}
+        shell: bash
+        env:
+          VERSION:  ${{ steps.release.outputs.version }}
+          CHANNELS: ${{ steps.inputs.outputs.channels }}
+          URL:      ${{ steps.release.outputs.installer_url }}
+          SHA:      ${{ steps.release.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          # Fetch the way SKIF does (?t=<time> bypasses the CDN cache)
+          for attempt in 1 2 3 4 5 6; do
+            curl -fsS "$CDN_URL/$REPOSITORY_KEY?t=$(date +%s)" -o check.json && \
+              jq -e --arg v "$VERSION" '.Main.Versions[] | select(.Name == $v)' check.json > /dev/null && break
+            echo "Not visible yet (attempt $attempt); retrying in 10s..."; sleep 10
+          done
+          IFS=, read -ra chans <<<"$CHANNELS"
+          for c in "${chans[@]}"; do
+            top=$(jq -r --arg c "$c" '[.Main.Versions[] | select(.Branches | index($c))][0].Name' check.json)
+            if [[ "$top" != "$VERSION" ]]; then echo "::error::$c offers $top, expected $VERSION"; exit 1; fi
+            echo "$c → $top"
+          done
+          curl -fsS "$URL?t=$(date +%s)" -o check.exe
+          got=$(sha256sum check.exe | cut -d' ' -f1)
+          if [[ "$got" != "$SHA" ]]; then echo "::error::Installer on the CDN has sha256 $got, expected $SHA"; exit 1; fi
+          echo "Installer download verified ($URL)"
+          printf '\n**Published.** %s now offers %s.\n' "${CHANNELS//,/, }" "$VERSION" >> "$GITHUB_STEP_SUMMARY"
