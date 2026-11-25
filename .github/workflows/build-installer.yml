@@ -238,13 +238,31 @@ jobs:
           ref: ${{ fromJSON(needs.resolve.outputs.shas).Installer }}
           path: Installer
 
-      # Release notes come from CHANGELOG.txt at the SpecialK commit that was built
+      # Release notes come from CHANGELOG.txt at the commits that were built
       - name: Check out SpecialK's CHANGELOG.txt
         uses: actions/checkout@v4
         with:
           repository: SpecialKO/SpecialK
           ref: ${{ fromJSON(needs.resolve.outputs.shas).SpecialK }}
           path: SpecialK
+          sparse-checkout: CHANGELOG.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Check out SKIF's CHANGELOG.txt
+        uses: actions/checkout@v4
+        with:
+          repository: SpecialKO/SKIF
+          ref: ${{ fromJSON(needs.resolve.outputs.shas).SKIF }}
+          path: SKIF
+          sparse-checkout: CHANGELOG.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Check out SKIV's CHANGELOG.txt
+        uses: actions/checkout@v4
+        with:
+          repository: SpecialKO/SKIV
+          ref: ${{ fromJSON(needs.resolve.outputs.shas).SKIV }}
+          path: SKIV
           sparse-checkout: CHANGELOG.txt
           sparse-checkout-cone-mode: false
 
@@ -366,6 +384,9 @@ jobs:
       - name: Gather release metadata
         id: meta
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ inputs.branch }}
         run: |
           $src = 'Installer\Source'
           function Get-Ver($path) {
@@ -387,13 +408,37 @@ jobs:
             Compress-Archive -Path 'artifacts\symbols\*' -DestinationPath $symZip -Force
           } else { $symZip = '' }
 
+          # Recorded on the release so the next build of this branch knows
+          # which component versions this installer shipped
+          $buildInfo = Join-Path $env:RUNNER_TEMP 'build-info.json'
+          [ordered]@{
+            branch   = $env:BRANCH
+            versions = [ordered]@{ SpecialK = $sk; SKIF = $skif; SKIFsvc = $svc; SKIV = $skiv; XInput_HID = $xinput }
+            commits  = $env:SHAS | ConvertFrom-Json
+          } | ConvertTo-Json -Depth 4 | Out-File $buildInfo -Encoding utf8NoBOM
+
+          # The previous release built from the same branch: SKIF and SKIV
+          # changes since the versions it shipped go into the release notes
+          $previous = Join-Path $env:RUNNER_TEMP 'previous-release.json'
+          python -I releases\.github\scripts\previous_release.py --repo '${{ github.repository }}' `
+            --branch $env:BRANCH --exclude-tag "v$sk" --output $previous
+          if ($LASTEXITCODE -ne 0) { throw 'Could not look up the previous release' }
+
           # Release notes for SKIF's updater: this version's section of
-          # SpecialK's CHANGELOG.txt, attached to the release as ReleaseNotes.txt
-          # so "Publish installer to CDN" uses exactly these notes.
-          $notesAsset = Join-Path $env:RUNNER_TEMP 'ReleaseNotes.txt'
-          python releases\.github\scripts\changelog_section.py SpecialK\CHANGELOG.txt $sk --output $notesAsset
+          # SpecialK's CHANGELOG.txt plus every SKIF/SKIV section since the
+          # previous release, attached to the release as ReleaseNotes.txt so
+          # "Publish installer to CDN" uses exactly these notes.
+          $notesAsset   = Join-Path $env:RUNNER_TEMP 'ReleaseNotes.txt'
+          $notesSummary = Join-Path $env:RUNNER_TEMP 'notes-summary.md'
+          python -I releases\.github\scripts\combine_changelogs.py `
+            --specialk SpecialK\CHANGELOG.txt $sk `
+            --component SKIF SKIF\CHANGELOG.txt $skif `
+            --component SKIV SKIV\CHANGELOG.txt $skiv `
+            --previous $previous --output $notesAsset --summary $notesSummary
           if ($LASTEXITCODE -eq 0) {
-            $changes = "**Changes:**`n`n``````text`n" + (Get-Content $notesAsset -Raw -Encoding utf8).TrimEnd() + "`n```````n"
+            $changes = "**Changes:**`n`n``````text`n" + (Get-Content $notesAsset -Raw -Encoding utf8).TrimEnd() + "`n```````n`n" +
+                       (Get-Content $notesSummary -Raw -Encoding utf8).TrimEnd() + "`n"
+            Get-Content $notesSummary -Raw -Encoding utf8 >> $env:GITHUB_STEP_SUMMARY
           } else {
             Write-Warning "No CHANGELOG.txt section for $sk in SpecialK; publishing this release to the CDN as a new version will be refused until it has one."
             $notesAsset = ''
@@ -432,6 +477,7 @@ jobs:
           "symbols=$symZip"                  >> $env:GITHUB_OUTPUT
           "notes=$notesFile"                 >> $env:GITHUB_OUTPUT
           "release_notes=$notesAsset"        >> $env:GITHUB_OUTPUT
+          "build_info=$buildInfo"            >> $env:GITHUB_OUTPUT
 
       - name: Upload installer as workflow artifact
         uses: actions/upload-artifact@v4
@@ -447,7 +493,7 @@ jobs:
         run: |
           $tag   = '${{ steps.meta.outputs.tag }}'
           $title = 'Special K ${{ steps.meta.outputs.version }}'
-          $assets = @('${{ steps.meta.outputs.installer }}')
+          $assets = @('${{ steps.meta.outputs.installer }}', '${{ steps.meta.outputs.build_info }}')
           if ('${{ steps.meta.outputs.symbols }}') { $assets += '${{ steps.meta.outputs.symbols }}' }
           if ('${{ steps.meta.outputs.release_notes }}') { $assets += '${{ steps.meta.outputs.release_notes }}' }
           $isPre = switch ('${{ inputs.prerelease }}') {
